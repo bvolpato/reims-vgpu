@@ -43,6 +43,9 @@ pub(crate) use host_os::open_loader;
 /// (`os/linux/import.rs`).
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use host_os::views_through_dma_bufs;
+/// Cached display-present GPU textures on a Linux IOSurface (`os/linux/surface.rs`).
+#[cfg(target_os = "linux")]
+pub(crate) use host_os::{cache_present_texture, cached_present_texture};
 /// A surface's memory lent to a device outside the runtime, on Linux (`os/linux/device_lend.rs`),
 /// and what a host attaches to a surface for as long as it lives.
 #[cfg(target_os = "linux")]
