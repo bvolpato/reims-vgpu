@@ -393,24 +393,21 @@ impl<P: Platform> HostDeviceCore<P> {
         self.pages.shift()
     }
 
-    /// Another reference to the IOSurface mapped at `mapping_id`, made on the device's queue;
-    /// `None` for an id out of range or a slot with no surface.
+    /// Another reference to the IOSurface mapped at `mapping_id`; `None` for an id out of range
+    /// or a slot with no surface.
     pub fn retain_surface_with_mapping_id(&self, mapping_id: u64) -> Option<P::Surface> {
         log::debug!("retain surface {mapping_id}");
-        let this = self.block_self()?;
-        self.hw_queue.sync(move || {
-            if mapping_id == 0 || mapping_id >= MAPPING_ID_COUNT {
-                log::warn!(
-                    "retain surface: mapping id {mapping_id} is not in 1..{MAPPING_ID_COUNT}"
-                );
-                return None;
-            }
-            let st = this.state.lock();
-            st.slots
-                .get(mapping_id.to_usize())
-                .and_then(|slot| slot.surface.as_ref())
-                .map(Handle::clone_ref)
-        })
+        if mapping_id == 0 || mapping_id >= MAPPING_ID_COUNT {
+            log::warn!(
+                "retain surface: mapping id {mapping_id} is not in 1..{MAPPING_ID_COUNT}"
+            );
+            return None;
+        }
+        let st = self.state.lock();
+        st.slots
+            .get(mapping_id.to_usize())
+            .and_then(|slot| slot.surface.as_ref())
+            .map(Handle::clone_ref)
     }
 
     /// Raises interrupt 0 through the block, which is called whether or not the device holds

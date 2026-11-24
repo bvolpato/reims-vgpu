@@ -22,6 +22,7 @@
 //! logged once and tried again at the next.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 use std::time::Duration;
 
@@ -43,11 +44,18 @@ pub const OUTSIDE: &str = "(outside every call)";
 /// Whether census mode can be on in this build: on Linux alone (module docs).
 const ON_THIS_OS: bool = cfg!(target_os = "linux");
 
+/// Fast-path enabled state: 0 = uninitialized, 1 = off, 2 = on.
+static ENABLED_STATE: AtomicU8 = AtomicU8::new(0);
+
 /// The census's directory, read once per process ([`chosen`]).
 fn dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(|| chosen(std::env::var(CENSUS_VAR).ok()))
-        .as_deref()
+    DIR.get_or_init(|| {
+        let res = chosen(std::env::var(CENSUS_VAR).ok());
+        ENABLED_STATE.store(if res.is_some() { 2 } else { 1 }, Ordering::Release);
+        res
+    })
+    .as_deref()
 }
 
 /// The census's directory for `value`, the variable's: `None` (census off) where it is unset,
@@ -78,8 +86,44 @@ fn announce_on(w: &mut impl std::io::Write, dir: &Path) {
 }
 
 /// Whether census mode is on.
+#[inline]
 pub fn on() -> bool {
-    dir().is_some()
+    match ENABLED_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => dir().is_some(),
+    }
+}
+
+/// Fast atomic overflow counters for already-recorded degradation kinds, reducing global
+/// `CENSUS` mutex contention when census mode is active.
+static EXTRA_COUNTS: OnceLock<Vec<(rt::Degradation, AtomicU64)>> = OnceLock::new();
+static EXTRA_DIRTY: AtomicBool = AtomicBool::new(false);
+
+fn extra_counts() -> &'static [(rt::Degradation, AtomicU64)] {
+    EXTRA_COUNTS.get_or_init(|| {
+        rt::Degradation::ALL
+            .iter()
+            .copied()
+            .map(|k| (k, AtomicU64::new(0)))
+            .collect()
+    })
+}
+
+fn kind_index(kind: rt::Degradation) -> Option<usize> {
+    extra_counts().iter().position(|(k, _)| *k == kind)
+}
+
+/// Bitset of kinds already registered in `CENSUS` so repeated `record()` calls take the
+/// lock-free atomic increment path.
+static SEEN_KINDS: OnceLock<Vec<AtomicBool>> = OnceLock::new();
+
+fn seen_kinds() -> &'static [AtomicBool] {
+    SEEN_KINDS.get_or_init(|| {
+        (0..rt::Degradation::ALL.len())
+            .map(|_| AtomicBool::new(false))
+            .collect()
+    })
 }
 
 /// One kind's record.
@@ -211,11 +255,24 @@ static WAKE_CV: Condvar = Condvar::new();
 /// is the kind's first, which the caller relays. Does nothing, answering `false`, with census
 /// mode off.
 pub fn record(kind: rt::Degradation, object: &str, relayed_natively: bool) -> bool {
+    if !on() {
+        return false;
+    }
+    if let Some(idx) = kind_index(kind)
+        && seen_kinds()[idx].load(Ordering::Acquire)
+    {
+        extra_counts()[idx].1.fetch_add(1, Ordering::Relaxed);
+        EXTRA_DIRTY.store(true, Ordering::Release);
+        return false;
+    }
     let Some(dir) = dir() else {
         return false;
     };
     start(dir);
     let first = CENSUS.lock().record(kind, object, relayed_natively);
+    if let Some(idx) = kind_index(kind) {
+        seen_kinds()[idx].store(true, Ordering::Release);
+    }
     if first {
         wake();
     }
@@ -224,7 +281,7 @@ pub fn record(kind: rt::Degradation, object: &str, relayed_natively: bool) -> bo
 
 /// `kind`, recorded, announced inside a call standing for `sel` ([`OUTSIDE`] for none).
 pub fn selector(kind: rt::Degradation, sel: &str) {
-    if dir().is_none() {
+    if !on() {
         return;
     }
     if CENSUS.lock().selector(kind, sel) {
@@ -288,6 +345,18 @@ fn write_forever(dir: &Path) -> ! {
 fn write_if_dirty(dir: &Path) {
     let json = {
         let mut census = CENSUS.lock();
+        let had_extra = EXTRA_DIRTY.swap(false, Ordering::AcqRel);
+        if had_extra && let Some(extras) = EXTRA_COUNTS.get() {
+            for (kind, counter) in extras {
+                let delta = counter.swap(0, Ordering::Relaxed);
+                if delta > 0
+                    && let Some(e) = census.entries.iter_mut().find(|e| e.kind == *kind)
+                {
+                    e.count = e.count.saturating_add(delta);
+                    census.dirty = true;
+                }
+            }
+        }
         if !census.dirty {
             return;
         }
